@@ -11,6 +11,7 @@
 //   - Display: CS=D1, DC=D3, BL=D6, SCK=D8, MISO=D9, MOSI=D10
 //   - GPS:     RX=19 (GPIO19, LP_UART_RX), TX=20 (GPIO20, LP_UART_TX)
 //   - SD-Karte: CS=D2, SCK=D8, MISO=D9, MOSI=D10 (SPI geteilt)
+//   - Zeit:    Deutsche Zeit (MEZ/MESZ) mit DST-Berechnung
 // ============================================================
 
 // ============================================================
@@ -36,7 +37,7 @@
 // ============================================================
 // SD CARD PINS (SPI Mode, geteilt mit Display)
 // ============================================================
-#define SD_CS       D2    // Chip Select (GEÄNDERT VON D4 AUF D2!)
+#define SD_CS       D2    // Chip Select
 
 #define SD_SCK      D8    // Geteilt mit Display
 #define SD_MISO     D9    // Geteilt mit Display
@@ -154,7 +155,7 @@ double lastLoggedLng = 0.0;
 bool sdStatusNeedsRedraw = true;
 
 // ============================================================
-// BULGARIAN TIME
+// GERMAN TIME WITH DST CALCULATION (MEZ/MESZ)
 // ============================================================
 int dayOfWeek(int year, int month, int day) {
     if (month < 3) { month += 12; year--; }
@@ -169,7 +170,10 @@ int lastSunday(int year, int month, int lastDay) {
     return lastDay - weekday;
 }
 
-bool getBulgarianTime(int &hour, int &minute, int &second) {
+// German Time: MEZ (UTC+1) or MESZ (UTC+2)
+// DST starts: Last Sunday in March at 02:00 MEZ -> 03:00 MESZ
+// DST ends:   Last Sunday in October at 03:00 MESZ -> 02:00 MEZ
+bool getGermanTime(int &hour, int &minute, int &second) {
     if (!gps.time.isValid() || !gps.date.isValid()) return false;
 
     int year = gps.date.year();
@@ -179,30 +183,50 @@ bool getBulgarianTime(int &hour, int &minute, int &second) {
     int utcMinute = gps.time.minute();
     int utcSecond = gps.time.second();
 
-    int offset = 2;
+    // Start with MEZ (UTC+1)
+    int offset = 1;
 
+    // Calculate last Sundays for DST transitions
     int marchLastSunday = lastSunday(year, 3, 31);
     int octoberLastSunday = lastSunday(year, 10, 31);
+
     bool daylightSaving = false;
 
+    // April through September: Always DST
     if (month > 3 && month < 10) {
         daylightSaving = true;
-    } else if (month == 3) {
-        if (day > marchLastSunday || (day == marchLastSunday && utcHour >= 1)) {
+    }
+    // March: DST starts on last Sunday at 02:00 UTC (03:00 MEZ)
+    else if (month == 3) {
+        if (day > marchLastSunday) {
             daylightSaving = true;
         }
-    } else if (month == 10) {
-        if (day < octoberLastSunday || (day == octoberLastSunday && utcHour < 1)) {
+        else if (day == marchLastSunday && utcHour >= 1) {  // 02:00 MEZ = 01:00 UTC
+            daylightSaving = true;
+        }
+    }
+    // October: DST ends on last Sunday at 03:00 MESZ (02:00 UTC)
+    else if (month == 10) {
+        if (day < octoberLastSunday) {
+            daylightSaving = true;
+        }
+        else if (day == octoberLastSunday && utcHour < 2) {  // 03:00 MESZ = 01:00 UTC
             daylightSaving = true;
         }
     }
 
-    if (daylightSaving) offset = 3;
+    if (daylightSaving) offset = 2;  // MESZ = UTC+2
+
+    // Apply timezone offset
     hour = utcHour + offset;
     minute = utcMinute;
     second = utcSecond;
 
-    if (hour >= 24) hour -= 24;
+    // Handle midnight rollover
+    if (hour >= 24) {
+        hour -= 24;
+    }
+
     return true;
 }
 
@@ -326,9 +350,16 @@ void createNewLogFile() {
 
     char timestamp[20];
     if (gps.date.isValid() && gps.time.isValid()) {
-        snprintf(timestamp, sizeof(timestamp), "%04d%02d%02d_%02d%02d%02d",
-                gps.date.year(), gps.date.month(), gps.date.day(),
-                gps.time.hour(), gps.time.minute(), gps.time.second());
+        int hour, minute, second;
+        if (getGermanTime(hour, minute, second)) {
+            snprintf(timestamp, sizeof(timestamp), "%04d%02d%02d_%02d%02d%02d",
+                    gps.date.year(), gps.date.month(), gps.date.day(),
+                    hour, minute, second);
+        } else {
+            snprintf(timestamp, sizeof(timestamp), "%04d%02d%02d_%02d%02d%02d",
+                    gps.date.year(), gps.date.month(), gps.date.day(),
+                    gps.time.hour(), gps.time.minute(), gps.time.second());
+        }
     } else {
         snprintf(timestamp, sizeof(timestamp), "%04d%02d%02d_%02d%02d%02d",
                 2024, 1, 1, 0, 0, 0);
@@ -385,7 +416,7 @@ void writeLogEntry() {
     float altitude = gps.altitude.isValid() ? gps.altitude.meters() : 0;
     int satellites = gps.satellites.isValid() ? gps.satellites.value() : 0;
 
-    if (getBulgarianTime(hour, minute, second)) {
+    if (getGermanTime(hour, minute, second)) {
         year = gps.date.year();
         month = gps.date.month();
         day = gps.date.day();
@@ -457,16 +488,16 @@ void drawSatellites() {
 
 void drawTime() {
     char timeBuffer[16];
-    getGPSTime(timeBuffer);
+    getGermanTimeString(timeBuffer);
     tft.setTextSize(2);
     tft.setTextColor(COLOR_WHITE, COLOR_BLACK);
     tft.setCursor(TIME_X, TIME_Y);
     tft.print(timeBuffer);
 }
 
-void getGPSTime(char *buffer) {
+void getGermanTimeString(char *buffer) {
     int hour, minute, second;
-    if (getBulgarianTime(hour, minute, second)) {
+    if (getGermanTime(hour, minute, second)) {
         snprintf(buffer, 16, "%02d:%02d:%02d", hour, minute, second);
     } else {
         strcpy(buffer, "--:--:--");
@@ -626,7 +657,7 @@ void setup() {
     Serial.println("XIAO ESP32-C5 + Round Display");
     Serial.println("GPS Speedometer + Odometer + SD Logger");
     Serial.println("TFT_DC on D3, GPS on LP_UART (GPIO19/20)");
-    Serial.println("SD_CS on D2 (changed from D4)");
+    Serial.println("SD_CS on D2, German Time (MEZ/MESZ)");
     Serial.println("======================================\n");
 
     // --- 1. SPI-Bus initialisieren (für Display UND SD-Karte) ---
