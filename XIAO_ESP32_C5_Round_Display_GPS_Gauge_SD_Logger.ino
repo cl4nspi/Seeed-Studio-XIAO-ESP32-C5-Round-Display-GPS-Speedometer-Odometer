@@ -7,17 +7,17 @@
 
 // ============================================================
 // XIAO ESP32-C5 + Round Display (GC9A01A) + GPS (ATGM336H) + SD Logger
-// Korrigierte Pin-Zuordnung (TFT_DC auf D3, GPS auf D7/D14):
+// Pin-Zuordnung:
 //   - Display: CS=D1, DC=D3, BL=D6, SCK=D8, MISO=D9, MOSI=D10
-//   - GPS:     RX=D7 (UART1), TX=D14 (UART1)
-//   - SD-Karte: CS=D4, SCK=D8, MISO=D9, MOSI=D10 (SPI geteilt)
+//   - GPS:     RX=19 (GPIO19, LP_UART_RX), TX=20 (GPIO20, LP_UART_TX)
+//   - SD-Karte: CS=D2, SCK=D8, MISO=D9, MOSI=D10 (SPI geteilt)
 // ============================================================
 
 // ============================================================
 // DISPLAY PINS (GC9A01A Round Display)
 // ============================================================
 #define TFT_CS      D1    // Chip Select
-#define TFT_DC      D3    // Data/Command (GEWÜNSCHT: D3!)
+#define TFT_DC      D3    // Data/Command (wie gewünscht!)
 #define TFT_RST     -1   // Reset (nicht verbunden)
 #define TFT_BL      D6    // Backlight
 
@@ -27,16 +27,16 @@
 #define TFT_MOSI    D10   // Shared MOSI
 
 // ============================================================
-// GPS PINS (ATGM336H auf UART1 - VERSCHOBEN AUF D7/D14)
+// GPS PINS (ATGM336H auf LP_UART - GPIO19/20)
 // ============================================================
-#define GPS_RX_PIN  D7    // UART1 RX (GPS TX → ESP RX) - GEÄNDERT VON D3 AUF D7!
-#define GPS_TX_PIN  D14   // UART1 TX (GPS RX → ESP TX) - GEÄNDERT VON D2 AUF D14!
+#define GPS_RX_PIN  19    // LP_UART_RX (GPS TX → ESP RX, GPIO19)
+#define GPS_TX_PIN  20    // LP_UART_TX (GPS RX → ESP TX, GPIO20)
 #define GPS_BAUD    9600
 
 // ============================================================
 // SD CARD PINS (SPI Mode, geteilt mit Display)
 // ============================================================
-#define SD_CS       D4    // Chip Select (muss anders sein als TFT_CS!)
+#define SD_CS       D2    // Chip Select (GEÄNDERT VON D4 AUF D2!)
 
 #define SD_SCK      D8    // Geteilt mit Display
 #define SD_MISO     D9    // Geteilt mit Display
@@ -112,7 +112,7 @@
 // GPS
 // ============================================================
 TinyGPSPlus gps;
-HardwareSerial GPSSerial(1);  // UART1 für GPS
+HardwareSerial GPSSerial(2);  // LP_UART = UART2 auf ESP32-C5
 
 // ============================================================
 // DISPLAY (Seeed Studio XIAO Round Display)
@@ -207,28 +207,122 @@ bool getBulgarianTime(int &hour, int &minute, int &second) {
 }
 
 // ============================================================
-// SD CARD FUNCTIONS
+// SD CARD FUNCTIONS (MIT DEBUG-CODE)
 // ============================================================
 void initSDCard() {
-    Serial.println("Initializing SD card...");
+    Serial.println("=== SD CARD INITIALIZATION ===");
+
+    // Setze CS-Pin auf HIGH (SD-Karte deaktivieren)
     pinMode(SD_CS, OUTPUT);
     digitalWrite(SD_CS, HIGH);
+    delay(10);  // Kurze Wartezeit für Stabilität
 
+    Serial.print("Initializing SD card on CS Pin D2... ");
     if (!SD.begin(SD_CS)) {
-        Serial.println("ERROR: SD Card initialization failed!");
+        Serial.println("[FAILED]");
+        Serial.println("  - Check if SD card is inserted correctly");
+        Serial.println("  - Check if SD card is formatted as FAT32");
+        Serial.println("  - Check if CS pin (D2) is connected properly");
+        Serial.println("  - Try a different SD card (max 32GB)");
         sdCardReady = false;
         sdStatusNeedsRedraw = true;
         return;
     }
 
+    Serial.println("[OK]");
+
+    // SD-Karten-Informationen anzeigen
+    uint8_t cardType = SD.cardType();
+    if (cardType == CARD_NONE) {
+        Serial.println("  - No SD card detected!");
+        sdCardReady = false;
+        sdStatusNeedsRedraw = true;
+        return;
+    }
+
+    Serial.print("  - Card Type: ");
+    if (cardType == CARD_MMC) {
+        Serial.println("MMC");
+    } else if (cardType == CARD_SD) {
+        Serial.println("SDSC");
+    } else if (cardType == CARD_SDHC) {
+        Serial.println("SDHC");
+    } else {
+        Serial.println("UNKNOWN");
+    }
+
+    // SD-Karten-Größe anzeigen
+    uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+    Serial.print("  - Card Size: ");
+    Serial.print(cardSize);
+    Serial.println(" MB");
+
+    // Dateisystem-Informationen
+    uint64_t totalBytes = SD.totalBytes();
+    uint64_t usedBytes = SD.usedBytes();
+    Serial.print("  - Total Space: ");
+    Serial.print(totalBytes / (1024 * 1024));
+    Serial.println(" MB");
+    Serial.print("  - Used Space: ");
+    Serial.print(usedBytes / (1024 * 1024));
+    Serial.println(" MB");
+    Serial.print("  - Free Space: ");
+    Serial.print((totalBytes - usedBytes) / (1024 * 1024));
+    Serial.println(" MB");
+
+    // Dateiliste anzeigen
+    listSDFiles();
+
     sdCardReady = true;
-    Serial.println("SD Card ready!");
     createNewLogFile();
     sdStatusNeedsRedraw = true;
+    Serial.println("=== SD CARD READY ===\n");
+}
+
+// Liste aller Dateien auf der SD-Karte anzeigen
+void listSDFiles() {
+    Serial.println("  - Listing files on SD card:");
+    File root = SD.open("/");
+    if (!root) {
+        Serial.println("    [ERROR] Failed to open root directory!");
+        return;
+    }
+
+    int fileCount = 0;
+    int dirCount = 0;
+    File entry;
+    while (entry = root.openNextFile()) {
+        if (entry.isDirectory()) {
+            Serial.print("    [DIR]  ");
+            Serial.println(entry.name());
+            dirCount++;
+        } else {
+            Serial.print("    [FILE] ");
+            Serial.print(entry.name());
+            Serial.print(" (");
+            Serial.print(entry.size() / 1024);
+            Serial.println(" KB)");
+            fileCount++;
+        }
+        entry.close();
+    }
+    root.close();
+
+    if (fileCount == 0 && dirCount == 0) {
+        Serial.println("    (No files or directories found)");
+    } else {
+        Serial.print("  - Total: ");
+        Serial.print(fileCount);
+        Serial.print(" files, ");
+        Serial.print(dirCount);
+        Serial.println(" directories");
+    }
 }
 
 void createNewLogFile() {
     if (!sdCardReady) return;
+
+    Serial.println("Creating new log file...");
 
     char timestamp[20];
     if (gps.date.isValid() && gps.time.isValid()) {
@@ -245,18 +339,21 @@ void createNewLogFile() {
 
     logFile = SD.open(currentLogFilename, FILE_WRITE);
     if (!logFile) {
-        Serial.println("ERROR: Failed to create log file!");
+        Serial.print("  [ERROR] Failed to create log file: ");
+        Serial.println(currentLogFilename);
         sdCardReady = false;
         sdStatusNeedsRedraw = true;
         return;
     }
 
+    Serial.print("  [OK] Created: ");
+    Serial.println(currentLogFilename);
+
+    // CSV-Header schreiben
     logFile.println("Timestamp,Latitude,Longitude,Speed_Kmph,Altitude_M,Satellites,Odometer_Km");
     logFile.flush();
     logFile.close();
     logEntryCount = 0;
-    Serial.print("Created log file: ");
-    Serial.println(currentLogFilename);
     sdStatusNeedsRedraw = true;
 }
 
@@ -275,7 +372,8 @@ void writeLogEntry() {
 
     logFile = SD.open(currentLogFilename, FILE_WRITE);
     if (!logFile) {
-        Serial.println("ERROR: Failed to open log file for writing!");
+        Serial.print("[SD ERROR] Failed to open log file: ");
+        Serial.println(currentLogFilename);
         sdCardReady = false;
         sdStatusNeedsRedraw = true;
         return;
@@ -310,12 +408,19 @@ void writeLogEntry() {
     logFile.flush();
     logFile.close();
 
+    // Debug-Output für erfolgreiches Logging
+    Serial.print("[LOG] Entry ");
+    Serial.print(logEntryCount + 1);
+    Serial.print(" written to ");
+    Serial.println(currentLogFilename);
+
     lastLogTime = millis();
     lastLoggedLat = gps.location.lat();
     lastLoggedLng = gps.location.lng();
     logEntryCount++;
 
     if (logEntryCount >= MAX_LOG_ENTRIES) {
+        Serial.println("[LOG] Max entries reached, creating new file...");
         createNewLogFile();
     }
 }
@@ -520,13 +625,14 @@ void setup() {
     Serial.println("======================================");
     Serial.println("XIAO ESP32-C5 + Round Display");
     Serial.println("GPS Speedometer + Odometer + SD Logger");
-    Serial.println("TFT_DC on D3, GPS on D7/D14");
-    Serial.println("======================================");
+    Serial.println("TFT_DC on D3, GPS on LP_UART (GPIO19/20)");
+    Serial.println("SD_CS on D2 (changed from D4)");
+    Serial.println("======================================\n");
 
     // --- 1. SPI-Bus initialisieren (für Display UND SD-Karte) ---
     Serial.println("Initializing SPI...");
     SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI, TFT_CS);  // Nur EINMAL aufrufen!
-    Serial.println("SPI OK");
+    Serial.println("SPI OK\n");
 
     // --- 2. Display ---
     Serial.println("Initializing Round Display (DC on D3)...");
@@ -538,17 +644,17 @@ void setup() {
     tft.setRotation(3);
     tft.fillScreen(COLOR_BLACK);
     drawStaticScreen();
-    Serial.println("Display OK");
+    Serial.println("Display OK\n");
 
     // --- 3. SD-Karte ---
     initSDCard();
 
-    // --- 4. GPS (UART1 auf D7/D14) ---
-    Serial.println("Initializing GPS (UART1 on D7/D14)...");
+    // --- 4. GPS (LP_UART auf GPIO19/20) ---
+    Serial.println("Initializing GPS (LP_UART on GPIO19/20)...");
     GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-    Serial.println("GPS OK");
+    Serial.println("GPS OK\n");
 
-    Serial.println("Waiting for GPS data...");
+    Serial.println("Waiting for GPS data...\n");
 }
 
 // ============================================================
