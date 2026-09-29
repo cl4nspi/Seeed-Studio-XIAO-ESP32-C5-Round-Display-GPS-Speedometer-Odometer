@@ -99,7 +99,7 @@
 // LOGGING CONFIGURATION
 // ============================================================
 #define LOG_INTERVAL_MS 10000      // Log every 10 second
-#define LOG_MIN_DISTANCE_M 5.0   // Log only if moved >5m
+#define LOG_MIN_DISTANCE_M 10.0   // Log only if moved >10m
 #define MAX_LOG_ENTRIES 10000    // Max entries per file
 #define LOG_FILE_PREFIX "GPS_TRACK"
 
@@ -654,7 +654,7 @@ void setup() {
   GPSSerial.println("$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28"); // Nur GGA + RMC aktivieren
   GPSSerial.println("$PMTK220,200*2F"); // 5 Hz Update-Rate
   GPSSerial.println("$PMTK301,2*2E");   // SBAS (EGNOS/WAAS) aktivieren
-  GPSSerial.println("$PMTK102*31");     // Warm Start erzwingen
+  //GPSSerial.println("$PMTK102*31");     // Warm Start erzwingen
 
   Serial.println("GPS OK\n");
   Serial.println("Waiting for GPS data...\n");
