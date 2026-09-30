@@ -100,7 +100,7 @@
 // ============================================================
 #define LOG_INTERVAL_MS 10000      // Log every 10 second
 #define LOG_MIN_DISTANCE_M 10.0   // Log only if moved >10m
-#define MAX_LOG_ENTRIES 10000    // Max entries per file
+#define MAX_LOG_ENTRIES 10000     // Max entries per file
 #define LOG_FILE_PREFIX "GPS_TRACK"
 
 // ============================================================
@@ -332,6 +332,12 @@ void listSDFiles() {
 void createNewLogFile() {
   if (!sdCardReady) return;
   Serial.println("Creating new log file...");
+
+  // Schließe die aktuelle Log-Datei, falls sie offen ist
+  if (logFile) {
+    logFile.close();
+  }
+
   char timestamp[20];
   if (gps.date.isValid() && gps.time.isValid()) {
     int hour, minute, second;
@@ -347,6 +353,8 @@ void createNewLogFile() {
     snprintf(timestamp, sizeof(timestamp), "%04d%02d%02d_%02d%02d%02d", 2024, 1, 1, 0, 0, 0);
   }
   snprintf(currentLogFilename, sizeof(currentLogFilename), "/%s_%s.CSV", LOG_FILE_PREFIX, timestamp);
+
+  // Öffne die Datei im WRITE-Modus und positioniere am Ende
   logFile = SD.open(currentLogFilename, FILE_WRITE);
   if (!logFile) {
     Serial.print(" [ERROR] Failed to create log file: ");
@@ -355,15 +363,20 @@ void createNewLogFile() {
     sdStatusNeedsRedraw = true;
     return;
   }
-  Serial.print(" [OK] Created: ");
-  Serial.println(currentLogFilename);
 
-  // CSV-Header schreiben
-  logFile.println("Timestamp,Latitude,Longitude,Speed_Kmph,Altitude_M,Satellites,Odometer_Km");
+  // Positioniere am Ende der Datei (wichtig für Appending!)
+  logFile.seekEnd();
+
+  // CSV-Header schreiben (nur wenn die Datei neu ist)
+  if (logFile.size() == 0) {
+    logFile.println("Timestamp,Latitude,Longitude,Speed_Kmph,Altitude_M,Satellites,Odometer_Km");
+  }
+
   logFile.flush();
-  logFile.close();
   logEntryCount = 0;
   sdStatusNeedsRedraw = true;
+  Serial.print(" [OK] Created: ");
+  Serial.println(currentLogFilename);
 }
 
 void writeLogEntry() {
@@ -376,13 +389,17 @@ void writeLogEntry() {
     if (distanceMeters < LOG_MIN_DISTANCE_M) return;
   }
 
-  logFile = SD.open(currentLogFilename, FILE_WRITE);
+  // Falls die Datei nicht offen ist, versuche sie zu öffnen
   if (!logFile) {
-    Serial.print("[SD ERROR] Failed to open log file: ");
-    Serial.println(currentLogFilename);
-    sdCardReady = false;
-    sdStatusNeedsRedraw = true;
-    return;
+    logFile = SD.open(currentLogFilename, FILE_WRITE);
+    if (!logFile) {
+      Serial.print("[SD ERROR] Failed to reopen log file: ");
+      Serial.println(currentLogFilename);
+      sdCardReady = false;
+      sdStatusNeedsRedraw = true;
+      return;
+    }
+    logFile.seekEnd(); // Positioniere am Ende
   }
 
   char buffer[128];
@@ -407,9 +424,10 @@ void writeLogEntry() {
   snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d,%.6f,%.6f,%.1f,%.1f,%d,%.2f",
            year, month, day, hour, minute, second,
            gps.location.lat(), gps.location.lng(), speed, altitude, satellites, odometerKm);
+
+  // Schreibe den Eintrag und flushen
   logFile.println(buffer);
-  logFile.flush();
-  logFile.close();
+  logFile.flush(); // Wichtig: Daten sofort auf die SD-Karte schreiben
 
   // Debug-Output für erfolgreiches Logging
   Serial.print("[LOG] Entry ");
@@ -424,6 +442,7 @@ void writeLogEntry() {
 
   if (logEntryCount >= MAX_LOG_ENTRIES) {
     Serial.println("[LOG] Max entries reached, creating new file...");
+    logFile.close(); // Schließe aktuelle Datei
     createNewLogFile();
   }
 }
@@ -654,7 +673,6 @@ void setup() {
   GPSSerial.println("$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28"); // Nur GGA + RMC aktivieren
   GPSSerial.println("$PMTK220,200*2F"); // 5 Hz Update-Rate
   GPSSerial.println("$PMTK301,2*2E");   // SBAS (EGNOS/WAAS) aktivieren
-  //GPSSerial.println("$PMTK102*31");     // Warm Start erzwingen
 
   Serial.println("GPS OK\n");
   Serial.println("Waiting for GPS data...\n");
