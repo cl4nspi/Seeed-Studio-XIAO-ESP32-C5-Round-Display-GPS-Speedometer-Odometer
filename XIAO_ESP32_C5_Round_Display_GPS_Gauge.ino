@@ -1,1219 +1,622 @@
+// ============================================================
+// XIAO ESP32-C5 + XIAO Round Display (GC9A01A) + GPS (ATGM336H) + SD Logger + WiFi Download
+// Pin-Zuordnung:
+// - Display: CS=D1, DC=D3, BL=D6, SCK=D8, MISO=D9, MOSI=D10
+// - GPS: RX=D4 (SoftwareSerial), TX=D5 (SoftwareSerial)
+// - SD-Karte: CS=D2, SCK=D8, MISO=D9, MOSI=D10 (SPI geteilt)
+// - Zeit: Deutsche Zeit (MEZ/MESZ) mit DST-Berechnung
+// - GPS-Optimierungen: SBAS, NMEA-Filterung, Warm Start
+// - NEU: Automatische Datei pro Fahrt
+// - NEU: WiFi Access Point zum Download der Log-Dateien
+// ============================================================
+
 #include <Arduino.h>
 #include <SPI.h>
+#include <SD.h>
+#include <FS.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_GC9A01A.h>
 #include <TinyGPS++.h>
+#include <SoftwareSerial.h>
+#include <WiFi.h>
+#include <WebServer.h>
 
 // ============================================================
-// XIAO ESP32 C5 Round Display GPS Gauge
-// GPS: D0 + D2
-// Display: GC9A01
-// Designed and build by Hayri
+// PIN-DEFINITIONEN (Ihre Konfiguration)
 // ============================================================
+#define TFT_CS    D1
+#define TFT_DC    D3
+#define TFT_RST  -1
+#define TFT_BL    D6
+#define TFT_SCLK  D8
+#define TFT_MISO  D9
+#define TFT_MOSI D10
 
+#define GPS_RX_PIN D4
+#define GPS_TX_PIN D5
+#define GPS_BAUD  9600
 
-// ============================================================
-// DISPLAY PINS
-// ============================================================
-
-#define TFT_CS      D1
-#define TFT_DC      D3
-#define TFT_RST     -1
-#define TFT_BL      D6
-
-#define TFT_SCLK    D8
-#define TFT_MISO    D9
-#define TFT_MOSI    D10
-
+#define SD_CS    D2
 
 // ============================================================
-// GPS PINS
+// WIFI KONFIGURATION (Access Point Modus)
 // ============================================================
+const char* AP_SSID = "XIAO-GPS-Logger";
+const char* AP_PASSWORD = "gps12345";
 
-// GPS TX -> XIAO D0
-// GPS RX -> XIAO D2
-
-#define GPS_RX_PIN  D0
-#define GPS_TX_PIN  D2
-
-// IMPORTANT:
-// Your known-working GPS test uses 9600 baud.
-#define GPS_BAUD    9600
-
+WebServer server(80);
+bool wifiConnected = false;
 
 // ============================================================
-// COLORS
+// KONFIGURATION
 // ============================================================
-
-#define COLOR_BLACK   0x0000
-#define COLOR_WHITE   0xFFFF
-#define COLOR_RED     0xF800
-#define COLOR_GREEN   0x07E0
-#define COLOR_BLUE    0x001F
-#define COLOR_YELLOW  0xFFE0
-
-
-// ============================================================
-// SCREEN SIZE
-// ============================================================
-
-#define SCREEN_W 240
-#define SCREEN_H 240
-
-
-// ============================================================
-// LAYOUT CONFIGURATION
-// ============================================================
-
-// ------------------------------------------------------------
-// SATELLITES
-// ------------------------------------------------------------
-
-#define SAT_X       80
-#define SAT_Y       210
-
-
-// ------------------------------------------------------------
-// TIME
-// ------------------------------------------------------------
-
-#define TIME_X      75
-#define TIME_Y      15
-
-
-// ------------------------------------------------------------
-// LATITUDE
-// ------------------------------------------------------------
-
-#define LAT_X       33
-#define LAT_Y       57
-
-
-// ------------------------------------------------------------
-// LONGITUDE
-// ------------------------------------------------------------
-
-#define LON_X      125
-#define LON_Y       57
-
-
-// ------------------------------------------------------------
-// SPEED
-// ------------------------------------------------------------
-
-#define SPEED_X     78
-#define SPEED_Y     92
-
-#define SPEED_TEXT_SIZE 5
-
-#define SPEED_UNIT_X   95
-#define SPEED_UNIT_Y  140
-
-
-// ------------------------------------------------------------
-// ODOMETER
-// ------------------------------------------------------------
-
-#define ODO_X       55
-#define ODO_Y       175
-
-#define ODO_TEXT_SIZE 3
-
-#define ODO_UNIT_X  180
-#define ODO_UNIT_Y  180
-
-
-// ============================================================
-// DISPLAY UPDATE RATE
-// ============================================================
-
 #define DISPLAY_INTERVAL_MS 250
-
+#define LOG_INTERVAL_MS 10000
+#define LOG_MIN_DISTANCE_M 10.0
+#define MAX_LOG_ENTRIES 10000
+#define LOG_FILE_PREFIX "GPS_TRACK"
+#define INACTIVITY_TIMEOUT_MS 600000  // 10 Minuten Inaktivitat
 
 // ============================================================
-// GPS
+// GLOBALE VARIABLEN
 // ============================================================
-
 TinyGPSPlus gps;
-
-
-// ============================================================
-// GPS SERIAL
-// ============================================================
-
-HardwareSerial GPSSerial(1);
-
-
-// ============================================================
-// DISPLAY
-// ============================================================
-
-Adafruit_GC9A01A tft(
-    TFT_CS,
-    TFT_DC,
-    TFT_RST
-);
-
-
-// ============================================================
-// ODOMETER
-// ============================================================
+SoftwareSerial GPSSerial(GPS_RX_PIN, GPS_TX_PIN);
+Adafruit_GC9A01A tft(TFT_CS, TFT_DC, TFT_RST);
 
 double odometerKm = 0.0;
-
 bool havePreviousPosition = false;
-
 double previousLat = 0.0;
 double previousLng = 0.0;
 
-
-// ============================================================
-// ODOMETER FILTER
-// ============================================================
-
 const double MIN_SPEED_KMPH = 3.0;
-
 const double MIN_VALID_STEP_METERS = 0.10;
-
 const double MAX_VALID_STEP_METERS = 50.0;
-
 const byte MAX_JUMP_REJECTS = 5;
-
 byte consecutiveJumpRejects = 0;
 
-
-// ============================================================
-// DISPLAY TIMER
-// ============================================================
-
 unsigned long lastDisplayUpdate = 0;
+unsigned long lastMovementTime = 0;
+unsigned long lastLogTime = 0;
+unsigned long logEntryCount = 0;
 
-
-// ============================================================
-// GPS DEBUG
-// ============================================================
-
-// Keep this TRUE while testing.
-// It prints the incoming NMEA stream to USB.
-
-#define GPS_DEBUG true
-
-unsigned long lastGPSDebug = 0;
-unsigned long gpsCharsReceived = 0;
-
+File logFile;
+bool sdCardReady = false;
+bool tripActive = false;
+char currentLogFilename[32] = "";
+double lastLoggedLat = 0.0;
+double lastLoggedLng = 0.0;
+bool sdStatusNeedsRedraw = true;
+int tripNumber = 0;
 
 // ============================================================
-// BULGARIAN GPS TIME
+// DEUTSCHE ZEIT (MEZ/MESZ)
 // ============================================================
-//
-// GPS provides UTC.
-//
-// Bulgaria:
-//   Winter = UTC + 2
-//   Summer = UTC + 3
-//
-// European DST:
-//   Starts: last Sunday of March at 01:00 UTC
-//   Ends:   last Sunday of October at 01:00 UTC
-//
-// This uses GPS date/time directly.
-// NO NTP.
-// NO WiFi.
-// Works completely offline.
-// ============================================================
-
-
-// ------------------------------------------------------------
-// Return weekday
-//
-// 0 = Sunday
-// 1 = Monday
-// ...
-// 6 = Saturday
-// ------------------------------------------------------------
-
-int dayOfWeek(int year, int month, int day)
-{
-    if (month < 3)
-    {
-        month += 12;
-        year--;
-    }
-
-    int K = year % 100;
-    int J = year / 100;
-
-    int h =
-        (day +
-         (13 * (month + 1)) / 5 +
-         K +
-         K / 4 +
-         J / 4 +
-         5 * J) % 7;
-
-    // Zeller:
-    // 0 = Saturday
-    // 1 = Sunday
-    // 2 = Monday
-    // ...
-    // Convert to:
-    // 0 = Sunday
-    // 1 = Monday
-    // ...
-    // 6 = Saturday
-
-    return (h + 6) % 7;
+int dayOfWeek(int year, int month, int day) {
+  if (month < 3) { month += 12; year--; }
+  int K = year % 100; int J = year / 100;
+  int h = (day + (13 * (month + 1)) / 5 + K + K / 4 + J / 4 + 5 * J) % 7;
+  return (h + 6) % 7;
 }
 
-
-// ------------------------------------------------------------
-// Find last Sunday of a month
-// ------------------------------------------------------------
-
-int lastSunday(
-    int year,
-    int month,
-    int lastDay
-)
-{
-    int weekday = dayOfWeek(
-        year,
-        month,
-        lastDay
-    );
-
-    return lastDay - weekday;
+int lastSunday(int year, int month, int lastDay) {
+  return lastDay - dayOfWeek(year, month, lastDay);
 }
 
+bool getGermanTime(int &hour, int &minute, int &second) {
+  if (!gps.time.isValid() || !gps.date.isValid()) return false;
 
-// ------------------------------------------------------------
-// Get Bulgarian local time from GPS UTC
-// ------------------------------------------------------------
+  int year = gps.date.year();
+  int month = gps.date.month();
+  int day = gps.date.day();
+  int utcHour = gps.time.hour();
+  int utcMinute = gps.time.minute();
+  int utcSecond = gps.time.second();
 
-bool getBulgarianTime(
-    int &hour,
-    int &minute,
-    int &second
-)
-{
-    if (!gps.time.isValid())
-        return false;
+  int offset = 1; // MEZ
+  int marchLastSunday = lastSunday(year, 3, 31);
+  int octoberLastSunday = lastSunday(year, 10, 31);
+  bool daylightSaving = false;
 
-    if (!gps.date.isValid())
-        return false;
+  if (month > 3 && month < 10) daylightSaving = true;
+  else if (month == 3) {
+    if (day > marchLastSunday) daylightSaving = true;
+    else if (day == marchLastSunday && utcHour >= 1) daylightSaving = true;
+  }
+  else if (month == 10) {
+    if (day < octoberLastSunday) daylightSaving = true;
+    else if (day == octoberLastSunday && utcHour < 2) daylightSaving = true;
+  }
 
+  if (daylightSaving) offset = 2;
+  hour = utcHour + offset;
+  minute = utcMinute;
+  second = utcSecond;
+  if (hour >= 24) hour -= 24;
+  return true;
+}
 
-    // --------------------------------------------------------
-    // GPS UTC
-    // --------------------------------------------------------
+// ============================================================
+// WIFI FUNKTIONEN
+// ============================================================
 
-    int year = gps.date.year();
-    int month = gps.date.month();
-    int day = gps.date.day();
+void initWiFi() {
+  Serial.println("\n=== WIFI INITIALIZATION ===");
+  
+  // Access Point Modus starten
+  Serial.print("Creating Access Point: ");
+  Serial.println(AP_SSID);
+  
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  delay(100);
+  
+  IPAddress myIP = WiFi.softAPIP();
+  Serial.print("AP IP address: ");
+  Serial.println(myIP);
+  
+  // Server Routen einrichten
+  server.on("/", handleRoot);
+  server.on("/list", handleFileList);
+  server.on("/download", handleFileDownload);
+  server.onNotFound(handleNotFound);
+  
+  server.begin();
+  Serial.println("HTTP server started");
+  
+  wifiConnected = true;
+}
 
-    int utcHour = gps.time.hour();
-    int utcMinute = gps.time.minute();
-    int utcSecond = gps.time.second();
+void handleRoot() {
+  server.sendHeader("Location", "/list");
+  server.send(302, "text/plain", "Redirecting to file list...");
+}
 
-
-    // --------------------------------------------------------
-    // Start with Bulgarian winter time
-    // UTC + 2
-    // --------------------------------------------------------
-
-    int offset = 2;
-
-
-    // --------------------------------------------------------
-    // Determine DST
-    // --------------------------------------------------------
-
-    int marchLastSunday =
-        lastSunday(
-            year,
-            3,
-            31
-        );
-
-    int octoberLastSunday =
-        lastSunday(
-            year,
-            10,
-            31
-        );
-
-
-    bool daylightSaving = false;
-
-
-    // --------------------------------------------------------
-    // April through September
-    // --------------------------------------------------------
-
-    if (month > 3 && month < 10)
-    {
-        daylightSaving = true;
-    }
-
-
-    // --------------------------------------------------------
-    // March
-    //
-    // DST starts on last Sunday at 01:00 UTC.
-    // --------------------------------------------------------
-
-    else if (month == 3)
-    {
-        if (day > marchLastSunday)
-        {
-            daylightSaving = true;
+void handleFileList() {
+  if (!sdCardReady) {
+    server.send(500, "text/plain", "SD card not ready");
+    return;
+  }
+  
+  String html = "<html><head><title>XIAO GPS Logger - Dateien</title><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body>"
+               "<h1>GPS Log-Dateien</h1>"
+               "<p>Verbunden mit: " + String(AP_SSID) + "</p>"
+               "<p><a href='/list'>Aktualisieren</a></p>"
+               "<ul>";
+  
+  File root = SD.open("/");
+  if (root) {
+    File entry = root.openNextFile();
+    while (entry) {
+      if (!entry.isDirectory()) {
+        String filename = entry.name();
+        if (filename.endsWith(".CSV") || filename.endsWith(".csv")) {
+          size_t size = entry.size();
+          html += "<li><a href='/download?file=" + String(filename) + "'>" + String(filename) + "</a> (" + String(size/1024.0, 1) + " KB)</li>";
         }
-        else if (
-            day == marchLastSunday &&
-            utcHour >= 1
-        )
-        {
-            daylightSaving = true;
-        }
+      }
+      entry = root.openNextFile();
     }
-
-
-    // --------------------------------------------------------
-    // October
-    //
-    // DST ends on last Sunday at 01:00 UTC.
-    // --------------------------------------------------------
-
-    else if (month == 10)
-    {
-        if (day < octoberLastSunday)
-        {
-            daylightSaving = true;
-        }
-        else if (
-            day == octoberLastSunday &&
-            utcHour < 1
-        )
-        {
-            daylightSaving = true;
-        }
-    }
-
-
-    if (daylightSaving)
-        offset = 3;
-
-
-    // --------------------------------------------------------
-    // Apply timezone offset
-    // --------------------------------------------------------
-
-    hour = utcHour + offset;
-
-    minute = utcMinute;
-    second = utcSecond;
-
-
-    // --------------------------------------------------------
-    // Handle midnight rollover
-    // --------------------------------------------------------
-
-    if (hour >= 24)
-    {
-        hour -= 24;
-    }
-
-
-    return true;
+    root.close();
+  }
+  
+  html += "</ul><p>Hinweis: Dateien werden automatisch pro Fahrt erstellt.</p></body></html>";
+  server.send(200, "text/html", html);
 }
 
-
-// ============================================================
-// READ GPS
-// ============================================================
-
-void readGPS()
-{
-    while (GPSSerial.available())
-    {
-        char c = GPSSerial.read();
-
-        gpsCharsReceived++;
-
-        // Feed EVERY character to TinyGPS++
-        gps.encode(c);
-
-        // Optional USB debug
-        if (GPS_DEBUG)
-        {
-            Serial.write(c);
-        }
-    }
+void handleFileDownload() {
+  if (!sdCardReady) {
+    server.send(500, "text/plain", "SD card not ready");
+    return;
+  }
+  
+  if (!server.hasArg("file")) {
+    server.send(400, "text/plain", "No file specified");
+    return;
+  }
+  
+  String filename = server.arg("file");
+  if (filename.indexOf("/") >= 0 || filename.indexOf("..") >= 0) {
+    server.send(400, "text/plain", "Invalid filename");
+    return;
+  }
+  
+  File file = SD.open("/" + filename);
+  if (!file) {
+    server.send(404, "text/plain", "File not found: " + filename);
+    return;
+  }
+  
+  server.sendHeader("Content-Type", "text/csv");
+  server.sendHeader("Content-Disposition", "attachment; filename=" + filename);
+  server.sendHeader("Content-Length", String(file.size()));
+  server.send(200);
+  
+  // Datei in Chunks senden
+  uint8_t buffer[1024];
+  size_t bytesRead;
+  while ((bytesRead = file.read(buffer, sizeof(buffer))) > 0) {
+    server.sendContent(buffer, bytesRead);
+  }
+  
+  file.close();
 }
 
-
-// ============================================================
-// UPDATE ODOMETER
-// ============================================================
-
-void updateGPSOdometer()
-{
-    if (!gps.location.isUpdated())
-        return;
-
-    if (!gps.location.isValid())
-        return;
-
-
-    // Need at least 4 satellites
-
-    if (!gps.satellites.isValid() ||
-        gps.satellites.value() < 4)
-    {
-        havePreviousPosition = false;
-        consecutiveJumpRejects = 0;
-        return;
-    }
-
-
-    // Ignore movement below 3 km/h
-
-    if (!gps.speed.isValid() ||
-        gps.speed.kmph() < MIN_SPEED_KMPH)
-    {
-        return;
-    }
-
-
-    double lat = gps.location.lat();
-
-    double lng = gps.location.lng();
-
-
-    // --------------------------------------------------------
-    // FIRST VALID POSITION
-    // --------------------------------------------------------
-
-    if (!havePreviousPosition)
-    {
-        previousLat = lat;
-
-        previousLng = lng;
-
-        havePreviousPosition = true;
-
-        consecutiveJumpRejects = 0;
-
-        return;
-    }
-
-
-    // --------------------------------------------------------
-    // DISTANCE
-    // --------------------------------------------------------
-
-    double distanceMeters =
-        TinyGPSPlus::distanceBetween(
-            previousLat,
-            previousLng,
-            lat,
-            lng
-        );
-
-
-    // --------------------------------------------------------
-    // VALID STEP
-    // --------------------------------------------------------
-
-    if (
-        distanceMeters >= MIN_VALID_STEP_METERS &&
-        distanceMeters <= MAX_VALID_STEP_METERS
-    )
-    {
-        odometerKm +=
-            distanceMeters / 1000.0;
-
-        previousLat = lat;
-
-        previousLng = lng;
-
-        consecutiveJumpRejects = 0;
-    }
-
-
-    // --------------------------------------------------------
-    // GPS JUMP
-    // --------------------------------------------------------
-
-    else if (distanceMeters > MAX_VALID_STEP_METERS)
-    {
-        consecutiveJumpRejects++;
-
-        if (
-            consecutiveJumpRejects >=
-            MAX_JUMP_REJECTS
-        )
-        {
-            previousLat = lat;
-
-            previousLng = lng;
-
-            consecutiveJumpRejects = 0;
-        }
-    }
+void handleNotFound() {
+  String message = "File Not Found\n\nURI: ";
+  message += server.uri();
+  message += "\nMethod: ";
+  message += (server.method() == HTTP_GET) ? "GET" : "POST";
+  message += "\nArguments: ";
+  message += server.args();
+  message += "\n";
+  for (uint8_t i = 0; i < server.args(); i++) {
+    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
+  }
+  server.send(404, "text/plain", message);
 }
 
-
 // ============================================================
-// FORMAT ODOMETER
+// SD-KARTEN FUNKTIONEN
 // ============================================================
+void initSDCard() {
+  Serial.println("=== SD CARD INITIALIZATION ===");
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+  delay(10);
 
-void formatOdometer(
-    double value,
-    char *buffer
-)
-{
-    if (value < 0.0)
-        value = 0.0;
-
-    if (value > 999.99)
-        value = 999.99;
-
-
-    int roundedValue =
-        (int)((value * 100.0) + 0.5);
-
-
-    int integerPart =
-        roundedValue / 100;
-
-
-    int fractionalPart =
-        roundedValue % 100;
-
-
-    snprintf(
-        buffer,
-        16,
-        "%03d.%02d",
-        integerPart,
-        fractionalPart
-    );
+  if (!SD.begin(SD_CS)) {
+    Serial.println("[FAILED] SD card initialization failed!");
+    sdCardReady = false;
+    return;
+  }
+  Serial.println("[OK] SD card ready");
+  sdCardReady = true;
+  tripNumber = 0;
+  createNewLogFile();
 }
 
+void createNewLogFile() {
+  if (!sdCardReady) return;
+  if (logFile) logFile.close();
 
-// ============================================================
-// GET BULGARIAN TIME
-// ============================================================
-
-void getGPSTime(
-    char *buffer
-)
-{
-    int hour;
-    int minute;
-    int second;
-
-
-    if (
-        getBulgarianTime(
-            hour,
-            minute,
-            second
-        )
-    )
-    {
-        snprintf(
-            buffer,
-            16,
-            "%02d:%02d:%02d",
-            hour,
-            minute,
-            second
-        );
+  tripNumber++;
+  char timestamp[25];
+  if (gps.date.isValid() && gps.time.isValid()) {
+    int hour, minute, second;
+    if (getGermanTime(hour, minute, second)) {
+      snprintf(timestamp, sizeof(timestamp), "%04d%02d%02d_T%02d%02d%02d_T%03d",
+               gps.date.year(), gps.date.month(), gps.date.day(), hour, minute, second, tripNumber);
+    } else {
+      snprintf(timestamp, sizeof(timestamp), "%04d%02d%02d_T%02d%02d%02d_T%03d",
+               gps.date.year(), gps.date.month(), gps.date.day(),
+               gps.time.hour(), gps.time.minute(), gps.time.second(), tripNumber);
     }
-    else
-    {
-        strcpy(
-            buffer,
-            "--:--:--"
-        );
-    }
+  } else {
+    snprintf(timestamp, sizeof(timestamp), "%04d%02d%02d_T000000_T%03d", 2024, 1, 1, tripNumber);
+  }
+
+  snprintf(currentLogFilename, sizeof(currentLogFilename), "/%s_%s.CSV", LOG_FILE_PREFIX, timestamp);
+  logFile = SD.open(currentLogFilename, FILE_WRITE);
+  if (!logFile) {
+    Serial.print("[ERROR] Failed to create: "); Serial.println(currentLogFilename);
+    sdCardReady = false;
+    return;
+  }
+
+  logFile.seek(0, SeekEnd);
+  if (logFile.size() == 0) {
+    logFile.println("Timestamp,Latitude,Longitude,Speed_Kmph,Altitude_M,Satellites,Odometer_Km");
+  }
+  logFile.flush();
+  logEntryCount = 0;
+  Serial.print("[OK] Log file: "); Serial.println(currentLogFilename);
 }
 
+void writeLogEntry() {
+  if (!sdCardReady || !gps.location.isValid() || !gps.time.isValid()) return;
+  if (millis() - lastLogTime < LOG_INTERVAL_MS) return;
+  if (LOG_MIN_DISTANCE_M > 0 && havePreviousPosition) {
+    double distanceMeters = TinyGPSPlus::distanceBetween(
+      lastLoggedLat, lastLoggedLng, gps.location.lat(), gps.location.lng());
+    if (distanceMeters < LOG_MIN_DISTANCE_M) return;
+  }
 
-// ============================================================
-// DRAW SATELLITES
-// ============================================================
-
-void drawSatellites()
-{
-    tft.setTextSize(2);
-
-    // Background color replaces old characters.
-
-    tft.setTextColor(
-        COLOR_WHITE,
-        COLOR_BLACK
-    );
-
-    tft.setCursor(
-        SAT_X,
-        SAT_Y
-    );
-
-
-    char satBuffer[8];
-
-
-    if (gps.satellites.isValid())
-    {
-        snprintf(
-            satBuffer,
-            sizeof(satBuffer),
-            "Sats:%02d",
-            gps.satellites.value()
-        );
+  if (!logFile) {
+    logFile = SD.open(currentLogFilename, FILE_WRITE);
+    if (!logFile) {
+      Serial.println("[SD ERROR] Failed to reopen log file");
+      sdCardReady = false;
+      return;
     }
-    else
-    {
-        strcpy(
-            satBuffer,
-            "Sats:--"
-        );
-    }
+    logFile.seek(0, SeekEnd);
+  }
 
+  char buffer[128];
+  int year, month, day, hour, minute, second;
+  float speed = gps.speed.isValid() ? gps.speed.kmph() : 0;
+  float altitude = gps.altitude.isValid() ? gps.altitude.meters() : 0;
+  int satellites = gps.satellites.isValid() ? gps.satellites.value() : 0;
 
-    tft.print(
-        satBuffer
-    );
+  if (getGermanTime(hour, minute, second)) {
+    year = gps.date.year(); month = gps.date.month(); day = gps.date.day();
+  } else {
+    year = gps.date.year(); month = gps.date.month(); day = gps.date.day();
+    hour = gps.time.hour(); minute = gps.time.minute(); second = gps.time.second();
+  }
+
+  snprintf(buffer, sizeof(buffer), "%04d-%02d-%02d %02d:%02d:%02d,%.6f,%.6f,%.1f,%.1f,%d,%.2f",
+           year, month, day, hour, minute, second,
+           gps.location.lat(), gps.location.lng(), speed, altitude, satellites, odometerKm);
+
+  logFile.println(buffer);
+  logFile.flush();
+
+  lastLogTime = millis();
+  lastLoggedLat = gps.location.lat();
+  lastLoggedLng = gps.location.lng();
+  logEntryCount++;
+
+  if (logEntryCount >= MAX_LOG_ENTRIES) {
+    logFile.close();
+    createNewLogFile();
+  }
 }
 
-
 // ============================================================
-// DRAW TIME
+// DISPLAY FUNKTIONEN
 // ============================================================
-
-void drawTime()
-{
-    char timeBuffer[16];
-
-
-    getGPSTime(
-        timeBuffer
-    );
-
-
-    tft.setTextSize(2);
-
-    tft.setTextColor(
-        COLOR_WHITE,
-        COLOR_BLACK
-    );
-
-
-    tft.setCursor(
-        TIME_X,
-        TIME_Y
-    );
-
-
-    tft.print(
-        timeBuffer
-    );
+void drawWiFiStatus() {
+  tft.setTextSize(1);
+  tft.setCursor(155, 210);
+  if (wifiConnected) {
+    tft.setTextColor(0x07E0, 0x0000); // Gruen
+    tft.print("WiFi");
+  } else {
+    tft.setTextColor(0xF800, 0x0000); // Rot
+    tft.print("WiFi");
+  }
 }
 
-
-// ============================================================
-// DRAW LATITUDE
-// ============================================================
-
-void drawLatitude()
-{
-    tft.setTextSize(1);
-
-    tft.setTextColor(
-        COLOR_WHITE,
-        COLOR_BLACK
-    );
-
-
-    tft.setCursor(
-        LAT_X,
-        LAT_Y
-    );
-
-
-    if (gps.location.isValid())
-    {
-        tft.print("LAT ");
-
-        tft.print(
-            gps.location.lat(),
-            6
-        );
-    }
-    else
-    {
-        tft.print(
-            "LAT --.------"
-        );
-    }
+void drawSDStatus() {
+  tft.setTextSize(1);
+  tft.setCursor(185, 210);
+  if (sdCardReady) {
+    tft.setTextColor(0x07E0, 0x0000); // Gruen
+    tft.print("SD");
+  } else {
+    tft.setTextColor(0xF800, 0x0000); // Rot
+    tft.print("SD");
+  }
 }
 
-
-// ============================================================
-// DRAW LONGITUDE
-// ============================================================
-
-void drawLongitude()
-{
-    tft.setTextSize(1);
-
-    tft.setTextColor(
-        COLOR_WHITE,
-        COLOR_BLACK
-    );
-
-
-    tft.setCursor(
-        LON_X,
-        LON_Y
-    );
-
-
-    if (gps.location.isValid())
-    {
-        tft.print("LON ");
-
-        tft.print(
-            gps.location.lng(),
-            6
-        );
-    }
-    else
-    {
-        tft.print(
-            "LON --.------"
-        );
-    }
+void drawTime() {
+  char timeBuffer[16];
+  int hour, minute, second;
+  if (getGermanTime(hour, minute, second)) {
+    snprintf(timeBuffer, 16, "%02d:%02d:%02d", hour, minute, second);
+  } else {
+    strcpy(timeBuffer, "--:--:--");
+  }
+  tft.setTextSize(2);
+  tft.setCursor(75, 15);
+  tft.setTextColor(0xFFFF, 0x0000);
+  tft.print(timeBuffer);
 }
 
-
-// ============================================================
-// DRAW SPEED
-// ============================================================
-
-void drawSpeed()
-{
-    char speedBuffer[8];
-
-
-    // --------------------------------------------------------
-    // SPEED NUMBER
-    // --------------------------------------------------------
-
-    if (gps.speed.isValid())
-    {
-        int speed =
-            (int)(gps.speed.kmph() + 0.5);
-
-
-        // Always three characters:
-        //
-        // 000
-        // 005
-        // 027
-        // 120
-
-        snprintf(
-            speedBuffer,
-            sizeof(speedBuffer),
-            "%03d",
-            speed
-        );
-    }
-    else
-    {
-        strcpy(
-            speedBuffer,
-            "---"
-        );
-    }
-
-
-    tft.setTextSize(
-        SPEED_TEXT_SIZE
-    );
-
-
-    tft.setTextColor(
-        COLOR_WHITE,
-        COLOR_BLACK
-    );
-
-
-    tft.setCursor(
-        SPEED_X,
-        SPEED_Y
-    );
-
-
-    tft.print(
-        speedBuffer
-    );
-
-
-    // --------------------------------------------------------
-    // km/h
-    // --------------------------------------------------------
-
-    tft.setTextSize(2);
-
-    tft.setTextColor(
-        COLOR_WHITE,
-        COLOR_BLACK
-    );
-
-
-    tft.setCursor(
-        SPEED_UNIT_X,
-        SPEED_UNIT_Y
-    );
-
-
-    tft.print(
-        "km/h"
-    );
+void drawSpeed() {
+  char speedBuffer[8];
+  if (gps.speed.isValid()) {
+    int speed = (int)(gps.speed.kmph() + 0.5);
+    snprintf(speedBuffer, sizeof(speedBuffer), "%03d", speed);
+  } else {
+    strcpy(speedBuffer, "---");
+  }
+  tft.setTextSize(5);
+  tft.setCursor(78, 90);
+  tft.setTextColor(0xFFFF, 0x0000);
+  tft.print(speedBuffer);
+  tft.setTextSize(2);
+  tft.setCursor(95, 135);
+  tft.print("km/h");
 }
 
-
-// ============================================================
-// DRAW ODOMETER
-// ============================================================
-
-void drawOdometer()
-{
-    char odometerBuffer[16];
-
-
-    formatOdometer(
-        odometerKm,
-        odometerBuffer
-    );
-
-
-    tft.setTextSize(
-        ODO_TEXT_SIZE
-    );
-
-
-    tft.setTextColor(
-        COLOR_WHITE,
-        COLOR_BLACK
-    );
-
-
-    tft.setCursor(
-        ODO_X,
-        ODO_Y
-    );
-
-
-    tft.print(
-        odometerBuffer
-    );
-
-
-    // --------------------------------------------------------
-    // km
-    // --------------------------------------------------------
-
-    tft.setTextSize(2);
-
-    tft.setTextColor(
-        COLOR_WHITE,
-        COLOR_BLACK
-    );
-
-
-    tft.setCursor(
-        ODO_UNIT_X,
-        ODO_UNIT_Y
-    );
-
-
-    tft.print(
-        "km"
-    );
+void drawOdometer() {
+  char odometerBuffer[16];
+  int roundedValue = (int)((odometerKm * 100.0) + 0.5);
+  snprintf(odometerBuffer, 16, "%03d.%02d", roundedValue / 100, roundedValue % 100);
+  tft.setTextSize(3);
+  tft.setCursor(55, 160);
+  tft.setTextColor(0xFFFF, 0x0000);
+  tft.print(odometerBuffer);
+  tft.setTextSize(1);
+  tft.setCursor(180, 165);
+  tft.print("km");
 }
 
+void drawSatellites() {
+  tft.setTextSize(1);
+  tft.setCursor(60, 195);
+  tft.setTextColor(0xFFFF, 0x0000);
+  if (gps.satellites.isValid()) {
+    tft.print("Sats:");
+    tft.print(gps.satellites.value());
+  } else {
+    tft.print("Sats:--");
+  }
+}
+
+void drawLatitude() {
+  tft.setTextSize(1);
+  tft.setCursor(30, 55);
+  tft.setTextColor(0xFFFF, 0x0000);
+  if (gps.location.isValid()) {
+    tft.print("LAT ");
+    tft.print(gps.location.lat(), 6);
+  } else {
+    tft.print("LAT --.------");
+  }
+}
+
+void drawLongitude() {
+  tft.setTextSize(1);
+  tft.setCursor(125, 55);
+  tft.setTextColor(0xFFFF, 0x0000);
+  if (gps.location.isValid()) {
+    tft.print("LON ");
+    tft.print(gps.location.lng(), 6);
+  } else {
+    tft.print("LON --.------");
+  }
+}
+
+void drawStaticScreen() {
+  tft.fillScreen(0x0000);
+  tft.drawLine(25, 40, 215, 40, 0xFFFF);
+  tft.drawLine(25, 155, 215, 155, 0xFFFF);
+  drawSatellites();
+  drawSDStatus();
+  drawWiFiStatus();
+  drawTime();
+  drawLatitude();
+  drawLongitude();
+  drawSpeed();
+  drawOdometer();
+}
 
 // ============================================================
-// DRAW STATIC SCREEN
+// GPS FUNKTIONEN
 // ============================================================
-//
-// This is the ONLY place where we clear the entire screen.
-//
-// After this, NO fillRect() or fillScreen() is used for
-// changing data.
+void readGPS() {
+  while (GPSSerial.available()) {
+    char c = GPSSerial.read();
+    gps.encode(c);
+    Serial.write(c); // Debug: NMEA-Daten an Serial ausgeben
+  }
+}
+
+void updateGPSOdometer() {
+  if (!gps.location.isUpdated() || !gps.location.isValid()) return;
+  if (!gps.satellites.isValid() || gps.satellites.value() < 4) {
+    havePreviousPosition = false;
+    consecutiveJumpRejects = 0;
+    return;
+  }
+
+  bool isMoving = (gps.speed.isValid() && gps.speed.kmph() >= MIN_SPEED_KMPH);
+  if (isMoving) {
+    lastMovementTime = millis();
+    if (!tripActive) {
+      tripActive = true;
+      odometerKm = 0.0;
+      havePreviousPosition = false;
+      createNewLogFile();
+      Serial.println("[TRIP] Neue Fahrt gestartet");
+    }
+  }
+
+  if (!gps.speed.isValid() || gps.speed.kmph() < MIN_SPEED_KMPH) return;
+
+  double lat = gps.location.lat();
+  double lng = gps.location.lng();
+
+  if (!havePreviousPosition) {
+    previousLat = lat;
+    previousLng = lng;
+    havePreviousPosition = true;
+    consecutiveJumpRejects = 0;
+    return;
+  }
+
+  double distanceMeters = TinyGPSPlus::distanceBetween(
+    previousLat, previousLng, lat, lng);
+
+  if (distanceMeters >= MIN_VALID_STEP_METERS && distanceMeters <= MAX_VALID_STEP_METERS) {
+    odometerKm += distanceMeters / 1000.0;
+    previousLat = lat;
+    previousLng = lng;
+    consecutiveJumpRejects = 0;
+  } else if (distanceMeters > MAX_VALID_STEP_METERS) {
+    consecutiveJumpRejects++;
+    if (consecutiveJumpRejects >= MAX_JUMP_REJECTS) {
+      previousLat = lat;
+      previousLng = lng;
+      consecutiveJumpRejects = 0;
+    }
+  }
+}
+
 // ============================================================
+// SETUP & LOOP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("=======================");
+  Serial.println("\nXIAO ESP32-C5 GPS Logger");
+  Serial.println("=======================");
 
-void drawStaticScreen()
-{
-    tft.fillScreen(
-        COLOR_BLACK
-    );
+  // SPI initialisieren
+  SPI.begin(TFT_SCLK, TFT_MISO, TFT_MOSI, TFT_CS);
 
+  // Display
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, HIGH);
+  tft.begin();
+  delay(500);
+  tft.invertDisplay(true);
+  tft.setRotation(3);
+  tft.fillScreen(0x0000);
+  drawStaticScreen();
 
-    // --------------------------------------------------------
-    // TOP DIVIDER
-    // --------------------------------------------------------
+  // SD-Karte
+  initSDCard();
 
-    tft.drawLine(
-        25,
-        40,
-        215,
-        40,
-        COLOR_WHITE
-    );
+  // GPS
+  GPSSerial.begin(GPS_BAUD);
+  delay(1000);
+  GPSSerial.println("$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28"); // only GGA + RMC aktiv
+  GPSSerial.println("$PMTK220,200*2F"); // 5 Hz Update-Rate
+  GPSSerial.println("$PMTK301,2*2E"); // SBAS (EGNOS/WAAS) aktivieren
 
+  // WiFi initialisieren
+  initWiFi();
 
-    // --------------------------------------------------------
-    // BOTTOM DIVIDER
-    // --------------------------------------------------------
+  // Trip Detection
+  lastMovementTime = millis();
+  tripActive = false;
 
-    tft.drawLine(
-        25,
-        165,
-        215,
-        165,
-        COLOR_WHITE
-    );
+  Serial.println("\n=== SYSTEM READY ===");
+  Serial.println("Connect to WiFi: " + String(AP_SSID));
+  Serial.println("Password: " + String(AP_PASSWORD));
+  Serial.println("Then open: http://" + WiFi.softAPIP().toString());
+}
 
+void loop() {
+  readGPS();
+  updateGPSOdometer();
 
-    // --------------------------------------------------------
-    // INITIAL DATA
-    // --------------------------------------------------------
+  // Inaktivitats-Erkennung
+  if (tripActive && millis() - lastMovementTime > INACTIVITY_TIMEOUT_MS) {
+    tripActive = false;
+    if (logFile) logFile.close();
+    Serial.println("[TRIP] Fahrt beendet (10 Min. Inaktivitat)");
+  }
 
+  writeLogEntry();
+
+  // WiFi Server bedienen
+  server.handleClient();
+
+  // Display aktualisieren
+  if (millis() - lastDisplayUpdate >= DISPLAY_INTERVAL_MS) {
+    lastDisplayUpdate = millis();
     drawSatellites();
-
     drawTime();
-
     drawLatitude();
-
     drawLongitude();
-
     drawSpeed();
-
     drawOdometer();
-}
-
-
-// ============================================================
-// SETUP
-// ============================================================
-
-void setup()
-{
-    // --------------------------------------------------------
-    // USB SERIAL
-    // --------------------------------------------------------
-
-    Serial.begin(
-        115200
-    );
-
-
-    delay(1000);
-
-
-    Serial.println();
-
-    Serial.println(
-        "=============================="
-    );
-
-    Serial.println(
-        "XIAO ESP32-C5 GPS + DISPLAY"
-    );
-
-    Serial.println(
-        "=============================="
-    );
-
-
-    // --------------------------------------------------------
-    // GPS
-    // --------------------------------------------------------
-
-    Serial.println(
-        "Starting GPS..."
-    );
-
-
-    GPSSerial.begin(
-        GPS_BAUD,
-        SERIAL_8N1,
-        GPS_RX_PIN,
-        GPS_TX_PIN
-    );
-
-
-    Serial.println(
-        "GPS UART started"
-    );
-
-    Serial.println(
-        "GPS: 9600 baud"
-    );
-
-    Serial.println(
-        "GPS TX -> D0"
-    );
-
-    Serial.println(
-        "GPS RX -> D2"
-    );
-
-
-    // --------------------------------------------------------
-    // BACKLIGHT
-    // --------------------------------------------------------
-
-    pinMode(
-        TFT_BL,
-        OUTPUT
-    );
-
-
-    digitalWrite(
-        TFT_BL,
-        HIGH
-    );
-
-
-    // --------------------------------------------------------
-    // SPI
-    // --------------------------------------------------------
-
-    Serial.println(
-        "Starting SPI..."
-    );
-
-
-    SPI.begin(
-        TFT_SCLK,
-        TFT_MISO,
-        TFT_MOSI,
-        TFT_CS
-    );
-
-
-    // --------------------------------------------------------
-    // DISPLAY
-    // --------------------------------------------------------
-
-    Serial.println(
-        "Starting display..."
-    );
-
-
-    tft.begin();
-
-
-    delay(500);
-
-
-    tft.invertDisplay(
-        true
-    );
-
-
-    // KEEP EXACTLY THE SAME ROTATION
-    tft.setRotation(
-        3
-    );
-
-
-    // --------------------------------------------------------
-    // INITIAL SCREEN
-    // --------------------------------------------------------
-
-    tft.fillScreen(
-        COLOR_BLACK
-    );
-
-
-    drawStaticScreen();
-
-
-    Serial.println(
-        "Display OK"
-    );
-
-
-    Serial.println(
-        "GPS OK"
-    );
-
-
-    Serial.println(
-        "Waiting for GPS data..."
-    );
-}
-
-
-// ============================================================
-// LOOP
-// ============================================================
-
-void loop()
-{
-    // --------------------------------------------------------
-    // GPS
-    // --------------------------------------------------------
-
-    readGPS();
-
-
-    // --------------------------------------------------------
-    // ODOMETER
-    // --------------------------------------------------------
-
-    updateGPSOdometer();
-
-
-    // --------------------------------------------------------
-    // DISPLAY
-    // --------------------------------------------------------
-
-    if (
-        millis() -
-        lastDisplayUpdate >=
-        DISPLAY_INTERVAL_MS
-    )
-    {
-        lastDisplayUpdate =
-            millis();
-
-
-        // NO fillScreen()
-        // NO fillRect()
-        //
-        // Background color automatically removes
-        // the previous characters.
-
-        drawSatellites();
-
-        drawTime();
-
-        drawLatitude();
-
-        drawLongitude();
-
-        drawSpeed();
-
-        drawOdometer();
-    }
+    drawSDStatus();
+    drawWiFiStatus();
+  }
 }
