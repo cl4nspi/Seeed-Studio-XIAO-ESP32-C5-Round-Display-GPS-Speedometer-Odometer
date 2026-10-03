@@ -235,7 +235,7 @@ void handleFileDownload() {
   uint8_t buffer[1024];
   size_t bytesRead;
   while ((bytesRead = file.read(buffer, sizeof(buffer))) > 0) {
-    server.sendContent(buffer, bytesRead);
+    server.sendContent((const char*)buffer, bytesRead);
   }
   
   file.close();
