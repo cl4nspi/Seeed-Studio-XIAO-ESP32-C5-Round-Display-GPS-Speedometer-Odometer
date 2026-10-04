@@ -1,13 +1,15 @@
 // ============================================================
-// XIAO ESP32-C5 + XIAO Round Display (GC9A01A) + GPS (ATGM336H) + SD Logger + WiFi Download
+// XIAO ESP32-C5 + XIAO Round Display (GC9A01A) + GPS (ATGM336H) + SD Logger + WiFi Download + Touch
 // Pin-Zuordnung:
 // - Display: CS=D1, DC=D3, BL=D6, SCK=D8, MISO=D9, MOSI=D10
 // - GPS: RX=D4 (SoftwareSerial), TX=D5 (SoftwareSerial)
 // - SD-Karte: CS=D2, SCK=D8, MISO=D9, MOSI=D10 (SPI geteilt)
+// - Touch: CS=D7, SCK=D8, MISO=D9, MOSI=D10 (SPI geteilt)
 // - Zeit: Deutsche Zeit (MEZ/MESZ) mit DST-Berechnung
 // - GPS-Optimierungen: SBAS, NMEA-Filterung, Warm Start
 // - NEU: Automatische Datei pro Fahrt
 // - NEU: WiFi Access Point zum Download der Log-Dateien
+// - NEU: Touch-Bedienung zum Ein-/Ausschalten von WiFi
 // ============================================================
 
 #include <Arduino.h>
@@ -20,6 +22,7 @@
 #include <SoftwareSerial.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <XPT2046_Touchscreen.h>
 
 // ============================================================
 // PIN-DEFINITIONEN (Ihre Konfiguration)
@@ -37,6 +40,23 @@
 #define GPS_BAUD  9600
 
 #define SD_CS    D2
+#define TOUCH_CS D7
+
+// ============================================================
+// TOUCHSCREEN KONFIGURATION
+// ============================================================
+#define TOUCH_CALIBRATION_X_MIN 200
+#define TOUCH_CALIBRATION_X_MAX 3800
+#define TOUCH_CALIBRATION_Y_MIN 200
+#define TOUCH_CALIBRATION_Y_MAX 3800
+
+// Touch-Bereich für WiFi-Toggle (Display-Koordinaten)
+#define WIFI_TOGGLE_X_MIN 180
+#define WIFI_TOGGLE_X_MAX 240
+#define WIFI_TOGGLE_Y_MIN 190
+#define WIFI_TOGGLE_Y_MAX 240
+
+XPT2046_Touchscreen ts(TOUCH_CS);
 
 // ============================================================
 // WIFI KONFIGURATION (Access Point Modus)
@@ -46,6 +66,7 @@ const char* AP_PASSWORD = "gps12345";
 
 WebServer server(80);
 bool wifiConnected = false;
+bool wifiEnabled = true;  // Standardmäßig eingeschaltet
 
 // ============================================================
 // KONFIGURATION
@@ -55,7 +76,8 @@ bool wifiConnected = false;
 #define LOG_MIN_DISTANCE_M 10.0
 #define MAX_LOG_ENTRIES 10000
 #define LOG_FILE_PREFIX "GPS_TRACK"
-#define INACTIVITY_TIMEOUT_MS 600000  // 10 Minuten Inaktivitat
+#define INACTIVITY_TIMEOUT_MS 600000  // 10 Minuten Inaktivität
+#define TOUCH_CHECK_INTERVAL_MS 100
 
 // ============================================================
 // GLOBALE VARIABLEN
@@ -78,6 +100,7 @@ byte consecutiveJumpRejects = 0;
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastMovementTime = 0;
 unsigned long lastLogTime = 0;
+unsigned long lastTouchCheck = 0;
 unsigned long logEntryCount = 0;
 
 File logFile;
@@ -86,7 +109,6 @@ bool tripActive = false;
 char currentLogFilename[32] = "";
 double lastLoggedLat = 0.0;
 double lastLoggedLng = 0.0;
-bool sdStatusNeedsRedraw = true;
 int tripNumber = 0;
 
 // ============================================================
@@ -137,9 +159,38 @@ bool getGermanTime(int &hour, int &minute, int &second) {
 }
 
 // ============================================================
+// TOUCH FUNKTIONEN
+// ============================================================
+void initTouch() {
+  Serial.println("=== TOUCHSCREEN INITIALIZATION ===");
+  ts.begin();
+  ts.setRotation(3);  // Muss zur Display-Rotation passen
+  Serial.println("[OK] Touchscreen ready");
+}
+
+void checkTouch() {
+  if (ts.touched()) {
+    TS_Point p = ts.getPoint();
+    
+    // Kalibrierte Koordinaten berechnen (für Display-Rotation 3)
+    int displayX = map(p.y, TOUCH_CALIBRATION_Y_MIN, TOUCH_CALIBRATION_Y_MAX, 0, 240);
+    int displayY = map(p.x, TOUCH_CALIBRATION_X_MIN, TOUCH_CALIBRATION_X_MAX, 240, 0);
+    
+    Serial.print("Touch: X="); Serial.print(displayX);
+    Serial.print(", Y="); Serial.println(displayY);
+    
+    // WiFi-Toggle-Bereich prüfen
+    if (displayX >= WIFI_TOGGLE_X_MIN && displayX <= WIFI_TOGGLE_X_MAX &&
+        displayY >= WIFI_TOGGLE_Y_MIN && displayY <= WIFI_TOGGLE_Y_MAX) {
+      toggleWiFi();
+      delay(200);  // Entprellen
+    }
+  }
+}
+
+// ============================================================
 // WIFI FUNKTIONEN
 // ============================================================
-
 void initWiFi() {
   Serial.println("\n=== WIFI INITIALIZATION ===");
   
@@ -164,6 +215,22 @@ void initWiFi() {
   Serial.println("HTTP server started");
   
   wifiConnected = true;
+}
+
+void toggleWiFi() {
+  wifiEnabled = !wifiEnabled;
+
+  if (wifiEnabled) {
+    if (!wifiConnected) {
+      initWiFi();
+    }
+    Serial.println("[WiFi] ENABLED");
+  } else {
+    WiFi.softAPdisconnect(true);
+    server.close();
+    wifiConnected = false;
+    Serial.println("[WiFi] DISABLED");
+  }
 }
 
 void handleRoot() {
@@ -367,25 +434,27 @@ void writeLogEntry() {
 // ============================================================
 void drawWiFiStatus() {
   tft.setTextSize(1);
-  tft.setCursor(155, 195);
-  if (wifiConnected) {
-    tft.setTextColor(0x07E0, 0x0000); // Gruen
-    tft.print("WiFi");
-  } else {
-    tft.setTextColor(0xF800, 0x0000); // Rot
-    tft.print("WiFi");
-  }
+  
+  // Hintergrund für Touch-Bereich
+  tft.fillRect(WIFI_TOGGLE_X_MIN, WIFI_TOGGLE_Y_MIN,
+               WIFI_TOGGLE_X_MAX - WIFI_TOGGLE_X_MIN,
+               WIFI_TOGGLE_Y_MAX - WIFI_TOGGLE_Y_MIN,
+               wifiEnabled ? 0x07E0 : 0xF800);  // Gruen oder Rot
+  
+  tft.setCursor(160, 200);
+  tft.setTextColor(0x0000, wifiEnabled ? 0x07E0 : 0xF800);
+  tft.print(wifiEnabled ? "WiFi:ON " : "WiFi:OFF");
 }
 
 void drawSDStatus() {
   tft.setTextSize(1);
-  tft.setCursor(60, 195);
+  tft.setCursor(185, 210);
   if (sdCardReady) {
     tft.setTextColor(0x07E0, 0x0000); // Gruen
-    tft.print("SD:OK ");
+    tft.print("SD");
   } else {
     tft.setTextColor(0xF800, 0x0000); // Rot
-    tft.print("SD:ERR");
+    tft.print("SD");
   }
 }
 
@@ -434,8 +503,8 @@ void drawOdometer() {
 }
 
 void drawSatellites() {
-  tft.setTextSize(2);
-  tft.setCursor(90,215);
+  tft.setTextSize(1);
+  tft.setCursor(60, 195);
   tft.setTextColor(0xFFFF, 0x0000);
   if (gps.satellites.isValid()) {
     tft.print("Sats:");
@@ -568,6 +637,9 @@ void setup() {
   tft.fillScreen(0x0000);
   drawStaticScreen();
 
+  // Touchscreen
+  initTouch();
+
   // SD-Karte
   initSDCard();
 
@@ -578,14 +650,17 @@ void setup() {
   GPSSerial.println("$PMTK220,200*2F"); // 5 Hz Update-Rate
   GPSSerial.println("$PMTK301,2*2E"); // SBAS (EGNOS/WAAS) aktivieren
 
-  // WiFi initialisieren
-  initWiFi();
+  // WiFi initialisieren (standardmäßig an)
+  if (wifiEnabled) {
+    initWiFi();
+  }
 
   // Trip Detection
   lastMovementTime = millis();
   tripActive = false;
 
   Serial.println("\n=== SYSTEM READY ===");
+  Serial.println("Touch the WiFi button (bottom right) to toggle WiFi on/off");
   Serial.println("Connect to WiFi: " + String(AP_SSID));
   Serial.println("Password: " + String(AP_PASSWORD));
   Serial.println("Then open: http://" + WiFi.softAPIP().toString());
@@ -604,8 +679,16 @@ void loop() {
 
   writeLogEntry();
 
-  // WiFi Server bedienen
-  server.handleClient();
+  // Touch abfragen
+  if (millis() - lastTouchCheck >= TOUCH_CHECK_INTERVAL_MS) {
+    lastTouchCheck = millis();
+    checkTouch();
+  }
+
+  // WiFi Server nur bedienen, wenn aktiv
+  if (wifiEnabled && wifiConnected) {
+    server.handleClient();
+  }
 
   // Display aktualisieren
   if (millis() - lastDisplayUpdate >= DISPLAY_INTERVAL_MS) {
