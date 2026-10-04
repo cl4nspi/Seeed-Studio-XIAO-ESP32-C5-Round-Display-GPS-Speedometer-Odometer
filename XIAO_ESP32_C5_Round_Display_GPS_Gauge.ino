@@ -367,7 +367,7 @@ void writeLogEntry() {
 // ============================================================
 void drawWiFiStatus() {
   tft.setTextSize(1);
-  tft.setCursor(155, 210);
+  tft.setCursor(155, 195);
   if (wifiConnected) {
     tft.setTextColor(0x07E0, 0x0000); // Gruen
     tft.print("WiFi");
@@ -379,13 +379,13 @@ void drawWiFiStatus() {
 
 void drawSDStatus() {
   tft.setTextSize(1);
-  tft.setCursor(185, 210);
+  tft.setCursor(60, 195);
   if (sdCardReady) {
     tft.setTextColor(0x07E0, 0x0000); // Gruen
-    tft.print("SD");
+    tft.print("SD:OK ");
   } else {
     tft.setTextColor(0xF800, 0x0000); // Rot
-    tft.print("SD");
+    tft.print("SD:ERR");
   }
 }
 
@@ -434,8 +434,8 @@ void drawOdometer() {
 }
 
 void drawSatellites() {
-  tft.setTextSize(1);
-  tft.setCursor(60, 195);
+  tft.setTextSize(2);
+  tft.setCursor(90,215);
   tft.setTextColor(0xFFFF, 0x0000);
   if (gps.satellites.isValid()) {
     tft.print("Sats:");
